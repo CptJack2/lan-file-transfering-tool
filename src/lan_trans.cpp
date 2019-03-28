@@ -1,6 +1,7 @@
 #include "lan_trans.h"
 #include"LocalFileGetter.h"
 #include"RemoteFileGetter.h"
+#include<qprogressbar.h>
 
 Lan_trans::Lan_trans(QWidget *parent)
 	: QMainWindow(parent){
@@ -14,6 +15,8 @@ Lan_trans::Lan_trans(QWidget *parent)
 	fv2 = new FileView(ui.lineEdit_3, ui.listWidget_2, (QIcon(*)[])&icons,
 		new RemoteFileGetter(&slt1));
 	slt1.pRemotefv = fv2;
+	slt1.pPBar = ui.progressBar;
+	slt1.pstbar = ui.statusBar;
 
 	connect(ui.pushButton_2, &QPushButton::clicked, this, &Lan_trans::btn_con_click);
 	connect(ui.pushButton, &QPushButton::clicked, this, &Lan_trans::btn_estab_click);
@@ -54,8 +57,9 @@ void Lan_trans::btn_get_click() {
 	QString filen = ui.lineEdit_3->text() + "/" + fv2->curfilelist[k].name;
 	if (ui.lineEdit_2->text().isEmpty() || ui.lineEdit_2->text() == "all disks")
 		return;
-	slt1.cli_get(filen, ui.lineEdit_2->text());
-	int c = 1;
+	
+	slt1.AddToGetQueue(filen, ui.lineEdit_2->text());
+	ui.statusBar->showMessage(filen + " added to queue", 2000);
 }
 void Lan_trans::btn_put_click() {
 	QListWidgetItem *t = ui.listWidget->currentItem();

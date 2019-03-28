@@ -13,10 +13,15 @@ void sloter::new_client() {
 		//psendfilethread = new SendFileThread(mSocket);
 		emit cli_connected();
 	}
-	else{
-		//msrvSock为数据流，新建传输线程
-		//psendfilethread = new SendFileThread(msrvSock);
-	}
+	//运行到这里，客户端和服务端都确定了数据连接，可以开启上传文件守护线程
+	pgetfilethread = new GetFileThread(this);
+	pgetfilethread->start();
+	//QTcpSocket* trans = GetTransSock();
+	psendfilethread = new SendFileThread(GetTransSock());
+	//connect(psendfilethread, &QThread::finished, this, &sloter::SendFileFin);
+	connect(psendfilethread, SIGNAL(progress(int)), this, SLOT(progress_slot(int)));
+	//psendfilethread->pslt = this;
+	psendfilethread->start();
 }
 //服务端读出数据，客户端读出控制信息
 void sloter::mSocket_Read_Data() {
@@ -41,21 +46,8 @@ void sloter::ControlCmdArrivedProcedure(QTcpSocket* pctrlsock, QTcpSocket* ptran
 	//客户需要下载文件
 	if (cmdlst[0] == "get") {
 		QFileInfo f(de_EscapeRoute(cmdlst[1]));
-		//f.open(QIODevice::ReadOnly);
-		//从控制流发送文件的大小
-		int t = f.size();
-		QByteArray ba= QByteArray::number(t);
-		pctrlsock->write(ba);
-		pctrlsock->waitForBytesWritten();
-		//等待对方发送开始传输信号
-		pctrlsock->waitForReadyRead();
-		cmd = QString::fromUtf8(pctrlsock->readAll());
-		if (cmd != "start transfer")return;
-		//开启新线程传输文件
-		psendfilethread = new SendFileThread(msrvSock);
+		//设置文件名，使传输线程传输文件
 		psendfilethread->setFileName(de_EscapeRoute(cmdlst[1]));
-		connect(psendfilethread, &QThread::finished, this,&sloter::SendFileFin);
-		psendfilethread->start();
 	}
 	else if (cmdlst[0] == "put")
 		//put指令，这边发get指令去拉取
@@ -101,16 +93,30 @@ void sloter::msrvSock_Read_Data() {
 }
 //数据流收到数据的处理办法
 void sloter::DataArrivedProcedure(QTcpSocket* ptranssock) {
+	//头8个字节为文件长度
+	if (recv_file_len == 0) {
+		QDataStream ds(ptranssock);
+		ds>>recv_file_len;
+	}
 	//写入到文件描述符
 	file_recv_buffer.append(ptranssock->readAll());
 	file_desc->write(file_recv_buffer);
 	file_recv_buffer.clear();
+	//更新pPBar
+	unsigned long long sc = file_desc->size() + file_recv_buffer.length();
+	static int c = 0;//根据进度发送进度信号的辅助变量
+	if (sc / 20 * 1024 * 1024 > c || sc >= recv_file_len){
+		pPBar->setValue(sc / (recv_file_len/100 )  );
+		pstbar->showMessage("receiving " + save_name);
+		++c;}
 	//根据已写的大小判断是否写入完毕
-	if (file_desc->size() + file_recv_buffer.length() >= recv_file_len) {
+	if ((long long)file_desc->size() + (long long)file_recv_buffer.length() >= recv_file_len) {
 		file_desc->close();
 		file_desc->~QFile();
 		file_desc = NULL;
-		emit transfer_done();
+		emit recv_done();
+		c = 0;
+		recv_file_len = 0;//重置接收文件长度
 	}
 }
 bool sloter::srv_listen() {
@@ -132,28 +138,22 @@ bool sloter::cli_connect(QString addr) {
 		return false;
 }
 void sloter::cli_get(QString filen,QString saveroute) {
-	//disconnect(mSocket, &QTcpSocket::readyRead, this, &sloter::mSocket_Read_Data);
+	//断开ctrlsock上的data处理函数
 	QTcpSocket* ctrl = GetCtrlSock_DisconnectSlot();
-	//向服务器发送命令
-	//TODO disconnect()ctrl proc
-	ctrl->write(QString("get "+EscapeRoute(filen)).toUtf8());
-	ctrl->waitForBytesWritten();
 	//获取路径中的纯文件名
 	QFileInfo qfi(filen);
 	save_name = qfi.fileName();
-	//等待对方返回文件大小
-	ctrl->waitForReadyRead(/*-1*/);
-	recv_file_len = ctrl->readAll().toInt();
+	//恢复ctrlsock上的data处理函数
 	RecoverSockSlot();
-	//发送开始传输指令
-	ctrl->write("start transfer");
-	ctrl->waitForBytesWritten();
 	//打开保存的文件描述符
 	file_desc = new QFile(saveroute+"/"+save_name);
 	file_desc->open(QIODevice::WriteOnly);
-	//利用qeventloop阻塞等待transfer_done信号
+	//向服务器发送命令
+	ctrl->write(QString("get " + EscapeRoute(filen)).toUtf8());
+	ctrl->waitForBytesWritten();
+	//利用qeventloop阻塞等待recv_done信号
 	QEventLoop loop;
-	connect(this, &sloter::transfer_done, &loop, &QEventLoop::quit);
+	connect(this, &sloter::recv_done, &loop, &QEventLoop::quit);
 	loop.exec();
 }
 sloter::sloter() {
@@ -197,11 +197,7 @@ QList<QString>  sloter::get_remote_disk_info() {
 }
 void sloter::cli_put(QString file, QString addr) {
 	//根据服务端指示变量判断哪个socket是控制流和传输流
-	QTcpSocket* ctrl;
-	if (!Im_server)
-		ctrl = mSocket;
-	else
-		ctrl = msrvSock;
+	QTcpSocket* ctrl = GetCtrlSock();
 	ctrl->write(("put " + EscapeRoute(file) + " " + de_EscapeRoute(addr)).toUtf8());
 	ctrl->waitForBytesWritten();
 }
@@ -227,18 +223,32 @@ void sloter::RecoverSockSlot() {
 //用于客户端连接并get remote disks后，通知服务端可以get remote disks了
 void sloter::TellPeerGetMyDisks() {
 	//根据服务端指示变量判断哪个socket是控制流和传输流
-	QTcpSocket* ctrl;
-	if (!Im_server)
-		ctrl = mSocket;
-	else
-		ctrl = msrvSock;
+	QTcpSocket* ctrl = GetCtrlSock();
 	ctrl->write("get_my_disks");
 	ctrl->waitForBytesWritten();
 }
-QString sloter::EscapeRoute(QString route) { return route.replace(" ", "@"); }
-QString sloter::de_EscapeRoute(QString route) { return route.replace("@", " "); }
+QString sloter::EscapeRoute(QString route) { return route.replace(" ", "╋"); }//随便找一个用不到的字符替代空格
+QString sloter::de_EscapeRoute(QString route) { return route.replace("╋", " "); }//否则在服务端命令解析的地方，带空格的文件名会被解析成多个命令
 void sloter::SendFileFin() {
 	psendfilethread->quit();
 	delete psendfilethread;
 	psendfilethread = nullptr;
+}
+QTcpSocket* sloter::GetCtrlSock() {
+	if (!Im_server)
+		return mSocket;
+	else
+		return msrvSock;
+}
+QTcpSocket* sloter::GetTransSock() {
+	if (Im_server)
+		return mSocket;
+	else
+		return msrvSock;
+}
+void sloter::progress_slot(int t) {
+	pPBar->setValue(t);
+}
+void sloter::AddToGetQueue(QString f, QString r) {
+	pgetfilethread->AddToQueue(f, r);
 }
